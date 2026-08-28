@@ -62,15 +62,19 @@ def measure(ff, case, clip, metrics, scratch=None):
 
     rate_capped = bool(vbv)
     attempt_args = [vbv, []] if vbv else [[]]
-    rc, out, err, timed_out, proc_seconds = 1, "", "", False, 0.0
+    rc, err, timed_out, proc_seconds = 1, "", False, 0.0
+    prog = runner.progress_file(clip)
+    progress_text = ""
     for index, extra in enumerate(attempt_args):
         cmd = runner.build_command(ff, case, clip, output=out_path,
-                                   output_format="matroska", extra_args=extra)
+                                   output_format="matroska", extra_args=extra,
+                                   progress_path=prog)
         started = time.monotonic()
         proc = runner.launch(cmd)
-        rc, out, err, timed_out = runner.collect(
+        rc, _out, err, timed_out = runner.collect(
             proc, runner.estimate_timeout(case, clip))
         proc_seconds = time.monotonic() - started
+        progress_text = runner.drain_progress(prog)
         if rc == 0 and not timed_out:
             rate_capped = bool(extra)
             break
@@ -83,7 +87,7 @@ def measure(ff, case, clip, metrics, scratch=None):
                % (case.label(), runner.first_error_line(err)))
         return None
 
-    progress = runner.parse_progress(out)
+    progress = runner.parse_progress(progress_text)
     bench = runner.parse_benchmark(err)
     frames = int(progress.get("frame", 0) or 0)
     elapsed = bench.get("rtime") or proc_seconds

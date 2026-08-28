@@ -51,9 +51,12 @@ Each of these encodes a bug that already happened once. Do not "simplify" them a
 
 1. **Never trust `ffmpeg -encoders`.** Hardware encoders are listed on machines with
    no such silicon and fail only at runtime. Every candidate must pass a live
-   2-frame encode (`probe._validate`), and the *exact invocation that worked* —
+   encode (`probe._validate`), and the *exact invocation that worked* —
    `pre_input`, `filters`, `extra_args` — is stored on the spec and reused verbatim
-   by the runner. Do not reconstruct hardware arguments anywhere else.
+   by the runner. Do not reconstruct hardware arguments anywhere else. The probe
+   clip is **640x360x5**, not a token 320x240x2: RADV's Vulkan encoder passes a
+   tiny clip and then dies with `VK_ERROR_DEVICE_LOST` at >=640x360, so too small
+   a probe green-lights an encoder that cannot encode. Do not shrink it back.
 
 2. **Calibration is keyed on `(encoder, resolution, preset)`.** x264 `ultrafast` is
    ~80x faster than `veryslow`; one estimate per encoder sizes fast runs so short
@@ -77,9 +80,19 @@ Each of these encodes a bug that already happened once. Do not "simplify" them a
 6. **`-nostdin` is mandatory.** Without it parallel ffmpeg processes fight over the
    terminal and the concurrency ramp deadlocks.
 
-7. **Read counters from `-progress pipe:1`, never scrape stderr.** `-benchmark`
-   supplies utime/stime/rtime/maxrss on stderr; those two sources are parsed
-   separately (`parse_progress`, `parse_benchmark`).
+7. **Read frame/size counters from `-progress`, never scrape stderr — and send
+   `-progress` to a private file, not `pipe:1`.** `-benchmark` supplies
+   utime/stime/rtime/maxrss on stderr; the two sources are parsed separately
+   (`parse_progress`, `parse_benchmark`). `-progress` shared stdout with the
+   encoder's own output, and Fedora's libx265 (linked against libvmaf) prints
+   `problem loading model file:` to stdout once per frame; it interleaved
+   mid-line with the counters (`problem loading model file: frame=364`), so
+   `parse_progress` lost the frame count and a healthy encode was recorded as
+   "no usable progress output" and skipped ~50% of the time. `build_command`
+   now writes `-progress file:<tmp>` via `runner.progress_file` /
+   `drain_progress` — one sink per encode (per stream in the concurrency ramp),
+   removed after it is read. `parse_progress` also hard-filters to the keys
+   `-progress` actually emits.
 
 8. **Throughput = frames / ffmpeg's own `rtime`**, falling back to wall time. Do not
    substitute the `fps=` field from progress — it is a rolling average.
@@ -109,14 +122,17 @@ Each of these encodes a bug that already happened once. Do not "simplify" them a
    flagged, not reported as the encoder's limit. `sources` measures a decode
    baseline per clip for exactly this.
 
-13. **"Throttled" means the clock fell, not that boost was not sustained.**
-   Comparing the observed clock against the CPU's *rated maximum* flags almost
-   every machine: it marked 24/67 tests on a 70 C Ryzen and 40/41 on a Pentium
-   Silver whose 1.1 GHz base and 3.1 GHz burst are by design. The flag requires
-   real evidence — the clock falling below 65% of the maximum observed *within
-   that same run* (after discarding `Sampler.WARMUP_SAMPLES` ramp-up samples),
-   or a sensor above 95 C. A flag that fires on healthy hardware is worse than
-   no flag.
+13. **"Throttled" means the clock fell *and stayed down*, not that boost was not
+   sustained, and not that the clock jittered.** Comparing against the CPU's
+   *rated maximum* flagged 24/67 tests on a 70 C Ryzen and 40/41 on a Pentium
+   Silver whose base clock is by design. Comparing the run's own min against its
+   own max (`min < 0.65 * max`) then flagged every long software encode on a
+   powersave box: averaged per-core `scaling_cur_freq` swings ~3x between work
+   units under a bursty encode with the governor perfectly healthy (seen: min
+   1.5 GHz, max 4.2 GHz, 81 C, no throttle). The flag now needs a *sustained
+   decline* — `Sampler.sustained_drop` compares an early-window mean against a
+   late-window mean and fires at >=35% — or a sensor above 95 C. A flag that
+   fires on healthy hardware is worse than no flag.
 
 14. **Concurrency "realtime" means the *minimum* per-stream fps held the target**,
     never the mean — an average hides streams that fell behind.
@@ -206,7 +222,10 @@ Each of these encodes a bug that already happened once. Do not "simplify" them a
 
 30. **Tiers execute lowest-first, interleaved across encoders**, and from tier 1 on
     are ordered fastest-known-encoder first (`Orchestrator._by_speed`) so a run that hits
-    its time budget still covers every encoder.
+    its time budget still covers every encoder. **The quality pass applies the same
+    ordering** (`run_quality` sorts by `_known_speed`): `quality_plan` yields encoders
+    in codec order, which put libaom-av1 first and — at ~2 fps — let it eat the entire
+    quality budget on a `quick` run while every mainstream encoder got no numbers.
 
 ## Conventions
 

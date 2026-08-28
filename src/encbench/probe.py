@@ -600,7 +600,12 @@ def _validate(ff, spec, nodes):
     for variant in variants:
         cmd = [ff.path, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
         cmd += variant["pre_input"]
-        cmd += ["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30", "-frames:v", "2"]
+        # 640x360x5, not a token 320x240x2: too small a clip lets a broken
+        # backend through. RADV's Vulkan encoder passes a 320x240 2-frame encode
+        # and then dies with VK_ERROR_DEVICE_LOST on anything >= 640x360 -- so
+        # the probe has to encode something a real workload would recognise.
+        # Still trivial: ~4s for the slowest software encoder, well under 45s.
+        cmd += ["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-frames:v", "5"]
         if variant["filters"]:
             cmd += ["-vf", ",".join(variant["filters"])]
         cmd += ["-c:v", spec.name] + extra + ["-f", "null", "-"]
@@ -634,6 +639,13 @@ def _looks_like_message(line):
     return letters >= 3
 
 
+# Per-frame noise from an encoder library that says nothing about the probe.
+# Fedora's libx265 (linked against libvmaf) prints these when it cannot find its
+# VMAF model; left in, one becomes the user-visible "reason" an encoder failed.
+_ERROR_NOISE = ("problem loading model file", "libvmaf error",
+                "could not read model from path")
+
+
 def _first_error(text):
     best = ""
     for line in (text or "").splitlines():
@@ -645,6 +657,8 @@ def _first_error(text):
         if not _looks_like_message(line):
             continue
         lowered = line.lower()
+        if any(n in lowered for n in _ERROR_NOISE):
+            continue
         # Prefer a line that actually names a failure over a version banner.
         if any(word in lowered for word in
                ("error", "failed", "cannot", "unable", "not supported",

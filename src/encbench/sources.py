@@ -150,6 +150,11 @@ class SourceLibrary(object):
         self.lossless_encoder = lossless_encoder or self._pick_lossless_encoder()
         self._cache = {}
         os.makedirs(self.dir, exist_ok=True)
+        # runner writes one -progress file here per encode and removes it when
+        # read; a hard kill (SIGKILL, second Ctrl-C) can orphan one. Sweep any
+        # left by an earlier run so they never accumulate.
+        for stale in glob.glob(os.path.join(self.dir, "progress_*.txt")):
+            _unlink(stale)
 
     def _pick_lossless_encoder(self):
         p = run([self.ff.path, "-hide_banner", "-encoders"], timeout=60)

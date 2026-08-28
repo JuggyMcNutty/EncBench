@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -147,15 +148,23 @@ def _round(v, n):
 # --------------------------------------------------------------------------
 
 def build_command(ff, case, clip, output="/dev/null", output_format="matroska",
-                  extra_args=None):
+                  extra_args=None, progress_path=None):
     spec = case.encoder
     # -benchmark writes at AV_LOG_INFO, so "-loglevel error" silently discards
     # utime/stime/rtime/maxrss and every throughput figure falls back to wall
     # clock -- which folds process startup, hardware init and filter-graph setup
     # into the measurement (understating a short ultrafast run by ~36%).
     # -nostats suppresses only the periodic progress line, which -progress replaces.
+    #
+    # -progress goes to a private file, never "pipe:1": Fedora's libx265 is linked
+    # against libvmaf and, on failing to find its model, prints a line to *stdout*
+    # once per frame. On the shared stdout stream that interleaves mid-line with
+    # the progress counters ("problem loading model file: frame=364"), parse_progress
+    # mis-keys it, the frame count is lost and a healthy encode reads back as
+    # "no usable progress output". A dedicated sink cannot be corrupted that way.
+    progress_target = ("file:" + progress_path) if progress_path else "pipe:1"
     cmd = [ff.path, "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats",
-           "-benchmark", "-progress", "pipe:1", "-y"]
+           "-benchmark", "-progress", progress_target, "-y"]
 
     # Hardware device initialisation must precede the input.
     cmd += spec.pre_input
@@ -227,13 +236,54 @@ def preset_args(case):
 # output parsing
 # --------------------------------------------------------------------------
 
+def progress_file(clip):
+    """Create a private file for one encode's -progress output.
+
+    Lives next to the source clip, i.e. in the scratch dir that was chosen to
+    have room. Tiny (a few KB); drain_progress removes it.
+    """
+    directory = os.path.dirname(clip.path) or "."
+    # No leading dot: a straggler (drain skipped by a hard crash) must still be
+    # swept by SourceLibrary.cleanup, whose glob("*") ignores hidden files.
+    fd, path = tempfile.mkstemp(prefix="progress_", suffix=".txt", dir=directory)
+    os.close(fd)
+    return path
+
+
+def drain_progress(path):
+    """Read a -progress file and delete it. Missing/partial is fine."""
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+# -progress emits only these keys; anything else on a line is foreign noise.
+_PROGRESS_KEY = re.compile(
+    r"^(frame|fps|stream_\d+_\d+_q|bitrate|total_size|out_time_us|out_time_ms|"
+    r"out_time|dup_frames|drop_frames|speed|progress)=(.*)$")
+
+
 def parse_progress(text):
-    """Last value of each -progress key."""
+    """Last value of each -progress key.
+
+    Only well-formed "key=value" lines whose key is one -progress actually emits
+    are accepted; a dedicated sink should be clean, but a strict parse means a
+    stray write from an encoder library can never masquerade as a counter.
+    """
     values = {}
     for line in (text or "").splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            values[k.strip()] = v.strip()
+        m = _PROGRESS_KEY.match(line.strip())
+        if m:
+            values[m.group(1)] = m.group(2).strip()
     return values
 
 
@@ -257,6 +307,13 @@ def is_session_limit(text):
     return any(p.search(text or "") for p in SESSION_LIMIT_PATTERNS)
 
 
+# Noise an encoder library emits regardless of whether the encode itself failed.
+# Fedora's libx265 spams "problem loading model file" / "libvmaf ERROR ..." once
+# per frame; without this it becomes the user-visible reason for an unrelated skip.
+_ERROR_NOISE = ("problem loading model file", "libvmaf error",
+                "could not read model from path")
+
+
 def first_error_line(text):
     best = ""
     for line in (text or "").splitlines():
@@ -270,6 +327,8 @@ def first_error_line(text):
         if line.startswith("[") and "]" in line:
             line = line.split("]", 1)[1].strip()
         lowered = line.lower()
+        if any(n in lowered for n in _ERROR_NOISE):
+            continue
         if any(word in lowered for word in
                ("error", "failed", "cannot", "unable", "not supported",
                 "no such", "invalid", "unsupported", "denied")):
@@ -329,6 +388,7 @@ class Sampler(threading.Thread):
         self.min_mhz = None
         self.max_mhz = None
         self.samples = 0
+        self.mhz_series = []
 
     def run(self):
         while not self._stop_event.is_set():
@@ -336,15 +396,40 @@ class Sampler(threading.Thread):
             if temp is not None:
                 self.max_temp = temp if self.max_temp is None else max(self.max_temp, temp)
             mhz = read_cpu_mhz()
-            if mhz is not None and self.samples >= self.WARMUP_SAMPLES:
-                self.min_mhz = mhz if self.min_mhz is None else min(self.min_mhz, mhz)
-                self.max_mhz = mhz if self.max_mhz is None else max(self.max_mhz, mhz)
+            if mhz is not None:
+                self.mhz_series.append(mhz)
+                if self.samples >= self.WARMUP_SAMPLES:
+                    self.min_mhz = mhz if self.min_mhz is None else min(self.min_mhz, mhz)
+                    self.max_mhz = mhz if self.max_mhz is None else max(self.max_mhz, mhz)
             self.samples += 1
             self._stop_event.wait(self.interval)
 
     def stop(self):
         self._stop_event.set()
         self.join(timeout=2)
+
+    def sustained_drop(self):
+        """How far the clock fell from the run's first half to its last half.
+
+        Throttling is a *sustained* downward trend -- the clock fell and stayed
+        down -- not instantaneous spread. On a many-core part running a bursty
+        encode, per-core scaling_cur_freq averaged across the package swings ~3x
+        between work units with the governor perfectly healthy, so the old
+        min < 0.65*max test fired on every long software encode on a powersave
+        box (min 1.5 GHz, max 4.2 GHz, 81 C, no actual throttle). Comparing an
+        early window's mean against a late one ignores that jitter and only
+        catches a real decline. Returns a fraction (0.3 == the late window ran
+        30% slower) or None when there are too few samples to judge.
+        """
+        series = self.mhz_series[self.WARMUP_SAMPLES:]
+        if len(series) < 8:
+            return None
+        half = len(series) // 2
+        early = sum(series[:half]) / half
+        late = sum(series[half:]) / (len(series) - half)
+        if early <= 0:
+            return None
+        return 1.0 - late / early
 
 
 _THERMAL_PATHS = None
@@ -444,7 +529,8 @@ def run_single(ff, case, clip, timeout=None, sample=True):
     """Run one encode and turn it into a TestResult."""
     result = TestResult(case)
     result.decode_fps = clip.decode_fps
-    cmd = build_command(ff, case, clip)
+    prog = progress_file(clip)
+    cmd = build_command(ff, case, clip, progress_path=prog)
     result.command = cmd
     timeout = timeout or estimate_timeout(case, clip)
 
@@ -454,28 +540,31 @@ def run_single(ff, case, clip, timeout=None, sample=True):
         sampler.start()
 
     start = time.monotonic()
-    proc = launch(cmd)
-    rc, out, err, timed_out = collect(proc, timeout)
+    try:
+        proc = launch(cmd)
+        rc, _out, err, timed_out = collect(proc, timeout)
+    finally:
+        progress_text = drain_progress(prog)
     wall = time.monotonic() - start
 
     if sampler:
         sampler.stop()
         result.temp_c = sampler.max_temp
         result.min_mhz = sampler.min_mhz
-        # Throttling means the clock FELL during the run, or the part got hot.
-        # It does not mean "this CPU did not sustain its single-core boost on
-        # all cores" -- that is true of essentially every modern processor, and
-        # comparing against the rated maximum flagged 24/67 tests on a 70 C
-        # Ryzen and 40/41 on a Pentium Silver whose 1.1 GHz base is by design.
-        effective = sampler.samples - Sampler.WARMUP_SAMPLES
-        if (sampler.min_mhz and sampler.max_mhz and effective >= 4
-                and sampler.min_mhz < sampler.max_mhz * 0.65):
+        # Throttling means the clock FELL and stayed down during the run, or the
+        # part got hot. It does not mean "this CPU did not sustain its single-core
+        # boost on all cores" -- true of essentially every modern processor -- nor
+        # "the averaged per-core clock jittered", which it always does under a
+        # bursty encode. Only a sustained decline (see Sampler.sustained_drop)
+        # or a real temperature counts.
+        drop = sampler.sustained_drop()
+        if drop is not None and drop >= 0.35:
             result.throttled = True
         if sampler.max_temp and sampler.max_temp >= 95:
             result.throttled = True
 
     result.wall_seconds = wall
-    _fill_result(result, case, rc, out, err, timed_out, wall)
+    _fill_result(result, case, rc, progress_text, err, timed_out, wall)
     return result
 
 
@@ -540,45 +629,50 @@ def _fill_result(result, case, rc, out, err, timed_out, wall):
 def run_parallel(ff, case, clip, count, timeout=None):
     """Launch `count` identical encodes at once; measure each independently."""
     timeout = timeout or estimate_timeout(case, clip) * 2
-    cmd = build_command(ff, case, clip)
+    # Each stream needs its own -progress sink, or they overwrite each other's
+    # counters and every stream reads back the same (wrong) fps.
+    progs = [progress_file(clip) for _ in range(count)]
+    cmds = [build_command(ff, case, clip, progress_path=p) for p in progs]
 
     sampler = Sampler()
     sampler.start()
 
     procs = []
     start = time.monotonic()
-    for _ in range(count):
-        procs.append(launch(cmd))
+    try:
+        for i in range(count):
+            procs.append(launch(cmds[i]))
 
-    collected = [None] * count
-    threads = []
+        collected = [None] * count
+        threads = []
 
-    def worker(index, proc):
-        collected[index] = collect(proc, timeout)
+        def worker(index, proc):
+            collected[index] = collect(proc, timeout)
 
-    for i, proc in enumerate(procs):
-        t = threading.Thread(target=worker, args=(i, proc), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-    wall = time.monotonic() - start
-
-    sampler.stop()
+        for i, proc in enumerate(procs):
+            t = threading.Thread(target=worker, args=(i, proc), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+    finally:
+        wall = time.monotonic() - start
+        sampler.stop()
+        progress_texts = [drain_progress(p) for p in progs]
 
     results = []
     for i in range(count):
         res = TestResult(case)
         res.decode_fps = clip.decode_fps
-        res.command = cmd
+        res.command = cmds[i]
         res.temp_c = sampler.max_temp
         res.wall_seconds = wall
         if collected[i] is None:
             res.error = "no result"
             results.append(res)
             continue
-        rc, out, err, timed_out = collected[i]
-        _fill_result(res, case, rc, out, err, timed_out, wall)
+        rc, _out, err, timed_out = collected[i]
+        _fill_result(res, case, rc, progress_texts[i], err, timed_out, wall)
         results.append(res)
     return results
 

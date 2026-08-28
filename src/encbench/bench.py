@@ -498,6 +498,12 @@ class Orchestrator(object):
                 for r in self.quality_results}
         cases = [c for c in cases
                  if (c.encoder.name, c.res_key, c.fps, c.bitrate, c.preset) not in done]
+        # Fastest encoder first (invariant 30). quality_plan yields encoders in
+        # codec order, which puts libaom-av1 -- often the slowest thing on the
+        # box -- first; on a tight budget it then consumes the whole quality
+        # pass and the encoders a user actually cares about get no numbers at
+        # all. sort is stable, so each encoder's low/target/high stay together.
+        cases.sort(key=lambda c: -self._known_speed(c.encoder))
         total = len(cases)
         if not total:
             detail("quality results already complete; nothing to re-measure")
