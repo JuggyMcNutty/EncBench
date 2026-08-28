@@ -2,12 +2,16 @@
 
 **Find out what your Linux box can actually do as a video encoder.**
 
-`encbench` discovers every video encoder your system can genuinely use, then measures
-throughput, resolution scaling, preset tradeoffs, concurrent stream capacity and
-encode quality — and prints it as readable tables plus a self-contained HTML report.
+`encbench` probes your system for every video encoder ffmpeg can genuinely use —
+validating each with a real encode, not just reading `ffmpeg -encoders` — then
+measures throughput, resolution scaling, preset tradeoffs, concurrent-stream
+capacity and encode quality. Output is readable tables plus a self-contained HTML
+report.
 
-One file to copy, no dependencies beyond Python 3.8+. If ffmpeg is missing it fetches
-a static build into scratch space and uses that.
+Stdlib-only Python 3.8+, one directory to copy, no install step. If ffmpeg is
+missing it fetches a static build into scratch space and uses that.
+
+## Quickstart
 
 ```bash
 ./encbench --list-encoders     # what can this machine do?
@@ -15,9 +19,7 @@ a static build into scratch space and uses that.
 ./encbench --profile quick     # ~3-5 min
 ```
 
----
-
-## What you get
+## Example output
 
 ```
 HEADLINE
@@ -27,7 +29,7 @@ HEADLINE
   Most parallel streams:  hevc_vaapi  12 simultaneous 1080p30 streams
 
 THROUGHPUT BY RESOLUTION
-  encode fps and multiple of realtime, at 30 fps, high-complexity content, target bitrate
+  encode fps and multiple of realtime, at 30 fps, high-complexity content
 
   ENCODER      TYPE  CODEC        360P       480P       720P      1080P      1440P      2160P
   ───────────  ────  ─────  ──────────  ─────────  ─────────  ─────────  ─────────  ─────────
@@ -49,61 +51,18 @@ CONCURRENT STREAM CAPACITY
   h264_vulkan  HW                   6           242  █████████·······  saturated at 8
   libx264      SW                   4           173  ███████·········  saturated at 6
   libx265      SW                   2          80.0  ███·············  saturated at 3
-```
 
-Plus a `--quality` pass that answers the question raw speed can't:
-
-```
+QUALITY  (--quality)
   ENCODER         TARGET     ACTUAL  VMAF    SSIM  PSNR dB   FPS
-  ───────────  ─────────  ─────────  ────  ──────  ───────  ────  ──────────────
-               12.0 Mbps  11.7 Mbps  89.2  0.8750    36.41   198  ██████████████
-               12.0 Mbps  11.8 Mbps  89.2  0.8750    36.41   211  ██████████████
-               12.0 Mbps  13.6 Mbps  91.0  0.8770    36.89  89.3  ██████████████
-               12.0 Mbps  13.7 Mbps  92.4  0.8780    37.10   314  ██████████████
-               12.0 Mbps  13.7 Mbps  92.4  0.8780    37.10   345  ██████████████
-               12.0 Mbps  13.5 Mbps  91.3  0.8780    36.82  43.0  ██████████████
+  ───────────  ─────────  ─────────  ────  ──────  ───────  ────
+  libx264      12.0 Mbps  11.7 Mbps  89.2  0.8750    36.41   198
+  libx265      12.0 Mbps  13.6 Mbps  91.0  0.8770    36.89  89.3
+  h264_vaapi   12.0 Mbps  13.7 Mbps  92.4  0.8780    37.10   314
+  hevc_vaapi   12.0 Mbps  13.5 Mbps  91.3  0.8780    36.82  43.0
 ```
 
-Hardware is ~2.5x faster here and slightly *worse* per bit. That tradeoff is the
-whole point of measuring it.
-
----
-
-## Why not just run ffmpeg yourself
-
-Three things quietly make a hand-rolled benchmark wrong.
-
-### `ffmpeg -encoders` lies about your hardware
-
-`h264_nvenc`, `h264_qsv`, `h264_amf` and `h264_v4l2m2m` are listed by any full ffmpeg
-build whether or not the silicon exists. encbench runs a real two-frame encode against
-every candidate and believes only the survivors — and when a failure is *fixable*, it
-says how:
-
-```
-! Hardware encoding is available but not usable yet (VA-API)
-    An AMD GPU is present at /dev/dri/renderD128, but ffmpeg cannot load the
-    VA-API runtime (libva). The VA driver itself is already installed, so this
-    is the only missing piece.
-    Fix:  sudo pacman -S libva libva-mesa-driver
-```
-
-It also separates "your hardware can't do this" from "you're missing a package".
-An AMD RDNA2 card reports *"VAAPI: av1 not supported by this hardware"* — because
-that engine really has no AV1 encoder — rather than an opaque linker error.
-
-### Fixed-length runs measure the wrong thing
-
-x264 `ultrafast` is roughly **eighty times** faster than `veryslow`. Any fixed frame
-count is either instantaneous for one or interminable for the other. Every timed run
-here is calibrated first, then sized so the measurement lasts a consistent wall time.
-
-### Encoder defaults aren't comparable
-
-GOP length is pinned to twice the framerate, so encoders with wildly different
-defaults (x264 250, libvpx 9999) are judged on the same keyframe cadence.
-
----
+Here hardware is ~2.5x faster than software and slightly worse per bit; `--quality`
+measures that tradeoff for your own content.
 
 ## What it measures
 
@@ -118,87 +77,8 @@ defaults (x264 250, libvpx 9999) are judged on the same keyframe cadence.
 | **Quality** (`--quality`) | PSNR, SSIM and VMAF against the source |
 | **CPU cost** | CPU seconds, cores used, peak RSS, fps per core |
 
-Instead of a full cross product (thousands of runs, many hours), the plan is a set of
-**axis sweeps around a baseline**: hold everything at 1080p30 target bitrate, then vary
-one dimension at a time. Each result isolates one variable, and the run actually finishes.
-
----
-
-## Usage
-
-**Depth**
-
-```
---profile quick|standard|deep   quick ~3-5 min, standard ~15-25 min (default), deep hours
---time-budget MINUTES           stop starting new tests after this long
---repeats N                     timed runs per config; the median is reported
---presets N                     how many speed-knob values to sample per encoder
---cooldown SECONDS              pause between tests (kind to passively-cooled boxes)
-```
-
-**Scope**
-
-```
---encoders libx264,libsvtav1    only these
---exclude libaom-av1            skip these
---hw-only / --sw-only           hardware or software only
---resolutions 720p,1080p        360p 480p 720p 1080p 1440p 2160p
---fps 30,60                     framerate targets
---bitrates low,target,high      rungs of the bitrate ladder
---complexity low,high           content classes
---all-encoders                  every video encoder, not just delivery codecs
---extended-codecs               also include mpeg2/mpeg4/vvc/theora/prores
-```
-
-**Measurements**
-
-```
---quality                       add PSNR/SSIM/VMAF (slower, opt-in)
---no-concurrency                skip the parallel-stream ramp
---concurrency-max N             highest stream count to try
---source FILE                   use your own footage
---source-format raw|lossless    raw removes the decode ceiling, lossless saves space
---frames N                      fixed frame count instead of auto-sizing
-```
-
-**ffmpeg and scratch**
-
-```
---ffmpeg PATH                   use a specific binary
---download / --no-download      force or forbid fetching a static build
---scratch-dir DIR               where clips and the ffmpeg cache live
---clean                         delete cached clips when finished
-```
-
-**Output**
-
-```
---json PATH / --html PATH       where to write results
---compare A.json B.json         diff two runs
---resume FILE.jsonl             continue an interrupted run
---no-report-files               terminal output only
---version
--v / --verbose, -q / --quiet, --no-color
-```
-
----
-
-## Output files
-
-Every run writes three files to `results/`:
-
-- **`<host>-<timestamp>.json`** — full results, system profile, ffmpeg identity
-- **`<host>-<timestamp>.html`** — self-contained report with charts, opens anywhere
-- **`<host>-<timestamp>.jsonl`** — appended as each test finishes, so an interrupted
-  run loses nothing and `--resume` picks it up
-
-Compare two machines, or the same machine before and after a driver change:
-
-```bash
-./encbench --compare results/amd.json results/intel.json
-```
-
----
+It holds a 1080p30 target-bitrate baseline and varies one dimension at a time, so
+each result isolates one variable and the run actually finishes.
 
 ## Requirements
 
@@ -206,53 +86,106 @@ Compare two machines, or the same machine before and after a driver change:
 - ffmpeg — or network access once, to fetch a static build
 - Scratch space: ~1 GB for `quick`, ~3 GB for `standard`
 
-Scratch defaults to `$TMPDIR` or `/tmp`. **If that's a small tmpfs it relocates to
-`/var/tmp` rather than eating your RAM**, and refuses with a clear message rather than
-filling a filesystem. (On a 7.6 GB test box with a 3.8 GB `/tmp` tmpfs, it correctly
-moved to btrfs on `/var/tmp`.)
+Scratch defaults to `$TMPDIR` or `/tmp`; if that is a small tmpfs it relocates to
+`/var/tmp` rather than consuming RAM, and refuses with a clear message rather than
+filling a filesystem.
 
----
+## Usage
 
-## How to read the results
+**Profiles** — `--profile quick` (~3-5 min) · `standard` (~15-25 min, default) ·
+`deep` (hours)
 
-- **Realtime multiple beats raw fps.** `2.0x` at 1080p30 means the box can do that
-  stream twice over. It's the number that tells you how many cameras, or how much
-  faster than playback your transcode will run.
-- **Hardware is not automatically better.** It's usually far faster and often worse
-  per bit. `--quality` settles it for *your* content.
-- **Multiple API paths may be the same silicon.** On AMD, VAAPI and Vulkan produce
-  byte-identical quality and saturate at the same stream count — they're two
-  front-ends to one VCN engine. The tool shows both; the choice is about integration,
-  not capability.
-- **Watch the notes section.** A `powersave` governor, thermal throttling or a
-  container CPU quota all mean the numbers understate the machine, and each is
-  reported alongside the results.
-- **Cross-machine numbers are only comparable on the same ffmpeg build**, which is why
-  the build's version and origin are recorded in every report.
+**ffmpeg / scratch**
 
----
+```
+--ffmpeg PATH                  use this ffmpeg binary
+--download / --no-download     force, or forbid, fetching a static build
+--scratch-dir DIR              where clips and the ffmpeg cache live
+--clean                        delete cached clips when finished
+```
+
+**Discovery & scope**
+
+```
+--list-encoders               probe, print the inventory, and exit
+--encoders A,B / --exclude A,B  restrict to, or skip, named encoders
+--hw-only / --sw-only          hardware or software only
+--all-encoders                 every video encoder, not just delivery codecs
+--extended-codecs              also include mpeg2/mpeg4/vvc/theora/prores
+```
+
+**Workload**
+
+```
+--time-budget MINUTES         stop starting new tests after this long
+--resolutions 720p,1080p      360p 480p 720p 1080p 1440p 2160p
+--fps 30,60                   framerate targets
+--bitrates low,target,high    rungs of the bitrate ladder
+--complexity low,high         content classes
+--presets N                   speed-knob values sampled per encoder
+--repeats N                   timed runs per config; the median is reported
+--frames N                    fixed frame count instead of auto-sizing
+--cooldown SECONDS            pause between tests
+```
+
+**Measurements**
+
+```
+--quality                     add PSNR/SSIM/VMAF (slower, opt-in)
+--no-concurrency              skip the parallel-stream ramp
+--concurrency-max N           highest stream count to try
+--source FILE                 use your own footage
+--source-format raw|lossless  raw removes the decode ceiling, lossless saves space
+```
+
+**Output**
+
+```
+--json PATH / --html PATH     where to write results
+--no-report-files             terminal output only
+--resume FILE.jsonl           continue an interrupted run
+--compare A.json B.json       diff two runs
+-v / -q / --no-color / --version
+```
+
+## Output files
+
+Every run writes to `results/`:
+
+- **`<host>-<timestamp>.json`** — full results, system profile, ffmpeg identity
+- **`<host>-<timestamp>.html`** — self-contained report with charts
+- **`<host>-<timestamp>.jsonl`** — appended per test, so `--resume` loses nothing
+
+```bash
+./encbench --compare results/amd.json results/intel.json
+```
+
+## Interpreting the results
+
+- **Realtime multiple beats raw fps.** `2.0x` at 1080p30 means the box can run
+  that stream twice over — the number that maps to camera count or transcode
+  headroom.
+- **Hardware is not automatically better.** Usually far faster, often worse per
+  bit. `--quality` settles it for your content.
+- **VAAPI and Vulkan on AMD are one engine.** Byte-identical quality, identical
+  saturation point — the choice is about integration, not capability.
+- **`short run`** in the bitrate column means under 10s of encoded video, where
+  one-pass rate control hasn't converged; not a real measurement.
+- **`decode-bound`** means the test approached the source's decode rate and is
+  measuring the decoder, not the encoder.
+- **Cross-machine numbers only compare on the same ffmpeg build** — its version
+  and origin are recorded in every report.
+- **Watch the warnings block.** A `powersave` governor, thermal throttling or a
+  container CPU quota all mean the numbers understate the machine.
 
 ## Methodology
 
-Documented in full in [AGENTS.md](AGENTS.md#invariants), but the short version:
+- Test footage is generated locally from deterministic filter graphs — no
+  downloads, identical on every machine.
+- Sources are stored raw where there's room, so a compressed source's decode
+  ceiling never caps a fast hardware encoder.
+- Throughput is frames ÷ ffmpeg's own `-benchmark` run time, output muxed to
+  `/dev/null` so storage speed never enters the measurement.
 
-Test footage is generated locally from deterministic filter graphs with fixed seeds —
-no downloads, no licensing, identical on every machine. Sources are stored **raw** when
-there's room, because a compressed source imposes a decode ceiling and a fast hardware
-encoder can end up measuring the *decoder*; anything that approaches that ceiling is
-flagged `decode-bound` rather than reported as the encoder's limit.
-
-Throughput is frames divided by ffmpeg's own `-benchmark` run time, with counters read
-from `-progress` rather than scraped from stderr. Output is muxed to `/dev/null`, so
-storage speed never enters the measurement.
-
-Bitrate accuracy is only reported for runs of **at least 10 seconds of encoded video**.
-Below that one-pass rate control hasn't converged — measured on this content, a libx264
-1080p30 run lands +70% at 4s, +18% at 8s, +9% at 10s and +4% at 15s. Shorter runs show
-`short run` instead of a misleading number.
-
-Quality compares against the exact clip that fed the encoder, pairing streams **by frame
-index rather than timestamp** — the default pairing silently compares neighbouring frames
-and returns plausible-but-wrong numbers. The pipeline self-checks before every quality
-pass by encoding losslessly and confirming a perfect score; if that fails, the quality
-pass is skipped rather than reporting bad data.
+Full methodology and the reasoning behind each rule:
+[AGENTS.md](AGENTS.md#invariants).
