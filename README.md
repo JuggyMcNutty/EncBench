@@ -15,8 +15,8 @@ missing it fetches a static build into scratch space and uses that.
 
 ```bash
 ./encbench --list-encoders     # what can this machine do?
-./encbench                     # full benchmark, ~15-25 min
-./encbench --profile quick     # ~3-5 min
+./encbench                     # full benchmark, 20-40 min
+./encbench --profile quick     # 5-15 min
 ```
 
 ## Example output
@@ -52,6 +52,18 @@ CONCURRENT STREAM CAPACITY
   libx264      SW                   4           173  ███████·········  saturated at 6
   libx265      SW                   2          80.0  ███·············  saturated at 3
 
+ENCODE LATENCY
+  input paced at realtime; delay is how many frames the encoder holds before its
+  first packet emerges - lookahead plus frame reordering
+
+  ENCODER      TYPE  POINT               MODE         DELAY fr    DELAY  WORST fr  FRAME TIME
+  ───────────  ────  ──────────────────  ───────────  ────────  ───────  ────────  ──────────
+  h264_vaapi   HW    1080p30             default           4.0    133 ms      +0.4     2.81 ms
+               HW    1080p30             low-latency       1.0     33 ms      +0.2     3.02 ms
+  libx264      SW    1080p30  fast       default          41.8   1393 ms      +3.2    11.29 ms
+               SW    1080p30  fast       low-latency       1.0     33 ms      +0.2    16.30 ms
+               SW    1080p30  ultrafast  default          10.5    350 ms      +1.0     1.75 ms
+
 QUALITY  (--quality)
   ENCODER         TARGET     ACTUAL  VMAF    SSIM  PSNR dB   FPS
   ───────────  ─────────  ─────────  ────  ──────  ───────  ────
@@ -62,7 +74,9 @@ QUALITY  (--quality)
 ```
 
 Here hardware is ~2.5x faster than software and slightly worse per bit; `--quality`
-measures that tradeoff for your own content.
+measures that tradeoff for your own content. And the fastest encoder in the first
+table adds 1.4 seconds of delay at its default settings, which is the whole reason
+the latency table exists.
 
 ## What it measures
 
@@ -74,11 +88,18 @@ measures that tradeoff for your own content.
 | **Bitrate & framerate** | whether either actually moves throughput |
 | **Content complexity** | smooth/low-motion vs dense/high-motion footage |
 | **Concurrent capacity** | most streams where *every* stream holds realtime |
+| **Latency** | frames held before a packet comes out, and what low-latency mode costs — for slow encoders too |
+| **Startup cost** | fixed overhead of one ffmpeg invocation |
 | **Quality** (`--quality`) | PSNR, SSIM and VMAF against the source |
 | **CPU cost** | CPU seconds, cores used, peak RSS, fps per core |
 
 It holds a 1080p30 target-bitrate baseline and varies one dimension at a time, so
-each result isolates one variable and the run actually finishes.
+each result isolates one variable and the run actually finishes. An encoder far
+below realtime at that baseline — libaom-av1 at 1.1 fps, say — gets **light
+testing**: the whole resolution ladder, so you still see how it scales, and none
+of the preset, bitrate, framerate or complexity sweeps. Asking whether bitrate
+moves the throughput of a 1.1 fps encoder costs minutes and answers nothing. The
+report names every encoder treated that way, with the rate that decided it.
 
 ## Requirements
 
@@ -92,8 +113,24 @@ filling a filesystem.
 
 ## Usage
 
-**Profiles** — `--profile quick` (~3-5 min) · `standard` (~15-25 min, default) ·
-`deep` (hours)
+**Profiles** — three scopes, not three stopwatches:
+
+| | measures | typical |
+|---|---|---|
+| `--profile quick` | 720p/1080p, 30 fps, one bitrate, 2 presets | 5-15 min |
+| `standard` (default) | 360p→2160p, 30/60 fps, 3 bitrates, 3 presets, both content classes | 20-40 min |
+| `deep` | the above as a full cross product, 3 repeats, plus quality | hours |
+
+None of them stops on a clock, so runtime depends on how many encoders the
+machine turns out to have and how fast it is — `quick` measured 6 min on a
+laptop with 9 encoders and 11 min on a 4-core box with 13. Each prints a projected total once it has calibrated
+them, and **encoders run in order of how widely they are used** — hardware
+h264/hevc first, then x264/x265, then AV1, with the reference encoders last. Stop
+a run early with Ctrl-C and it has already covered what most people came for; the
+report still renders and the `.jsonl` is resumable with `--resume`.
+
+Use `--time-budget MINUTES` to impose a wall. Anything dropped is then named in
+the report rather than silently missing.
 
 **ffmpeg / scratch**
 
@@ -118,6 +155,7 @@ filling a filesystem.
 
 ```
 --time-budget MINUTES         stop starting new tests after this long
+                              (no profile sets one; this is the only limit)
 --resolutions 720p,1080p      360p 480p 720p 1080p 1440p 2160p
 --fps 30,60                   framerate targets
 --bitrates low,target,high    rungs of the bitrate ladder
@@ -134,6 +172,7 @@ filling a filesystem.
 --quality                     add PSNR/SSIM/VMAF (slower, opt-in)
 --no-concurrency              skip the parallel-stream ramp
 --concurrency-max N           highest stream count to try
+--no-latency                  skip the encode-latency pass
 --source FILE                 use your own footage
 --source-format raw|lossless  raw removes the decode ceiling, lossless saves space
 ```
@@ -167,6 +206,17 @@ Every run writes to `results/`:
   headroom.
 - **Hardware is not automatically better.** Usually far faster, often worse per
   bit. `--quality` settles it for your content.
+- **Fast and low-latency are different questions.** Delay is a frame count, not a
+  time: an encoder holding 40 frames adds 1.3 s at 30 fps and 0.7 s at 60. It is
+  paid on top of the encode, and again by the decoder, so for anything live read
+  the latency table before the throughput one.
+- **Encoders missing from the latency table are missing on cost, not on
+  principle.** Delay comes from the difference between a paced and an unpaced
+  run, so the input is paced slowly enough that the two stay distinguishable —
+  slower than realtime for a slow encoder, which is why even sub-realtime
+  encoders get a figure. What that buys is wall time, and past a cap the point
+  is skipped and named in the notes. Delay is a frame count either way; the
+  milliseconds are what that many frames cost at the framerate you actually run.
 - **VAAPI and Vulkan on AMD are one engine.** Byte-identical quality, identical
   saturation point — the choice is about integration, not capability.
 - **`short run`** in the bitrate column means under 10s of encoded video, where
@@ -186,6 +236,12 @@ Every run writes to `results/`:
   ceiling never caps a fast hardware encoder.
 - Throughput is frames ÷ ffmpeg's own `-benchmark` run time, output muxed to
   `/dev/null` so storage speed never enters the measurement.
+- Latency is the difference between two runs of the same command, one with its
+  input paced. Startup cost cancels rather than being estimated, and the whole
+  pass is gated on reproducing two delays that are already known. The pacing
+  rate adapts to the encoder, which is what lets a sub-realtime encoder be
+  measured at all — verified against libx264 at three pacing rates, where the
+  frame delay held to within ~10%.
 
 Full methodology and the reasoning behind each rule:
 [AGENTS.md](AGENTS.md#invariants).

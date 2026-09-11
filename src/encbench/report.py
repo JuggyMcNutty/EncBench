@@ -284,7 +284,11 @@ def _encoder_order(results):
         if name not in seen:
             seen[name] = r.case.encoder
             order.append(r.case.encoder)
-    order.sort(key=lambda s: (s.codec, not s.hardware, s.name))
+    # Same ranking the run executes in (probe.popularity), so the table leads
+    # with the encoders most readers came for rather than with whatever codec
+    # sorts first alphabetically -- and so a partial report reads top-down.
+    from .probe import popularity
+    order.sort(key=lambda s: (popularity(s), s.codec, not s.hardware, s.name))
     return order
 
 
@@ -292,7 +296,8 @@ def _kind(spec):
     return green("HW") if spec.hardware else "SW"
 
 
-def render_headline(results, ramps, base_res, base_fps, out=None):
+def render_headline(results, ramps, base_res, base_fps, out=None,
+                    latency_records=None):
     """The three numbers most people actually came for."""
     out = out or sys.stdout
     base = [r for r in results
@@ -340,6 +345,19 @@ def render_headline(results, ramps, base_res, base_fps, out=None):
                           "%s  %s simultaneous %s%d streams" % (
                               bold(best_name), green(str(best_streams)),
                               base_res, base_fps)))
+
+    # Deliberately the default-settings figure: the point of the headline is
+    # that the fastest encoder in the table above is often not the one to reach
+    # for when latency matters.
+    lat = [r for r in (latency_records or [])
+           if r.get("ok") and r.get("mode") == "default"
+           and r.get("axis") == "baseline" and r.get("delay_ms") is not None]
+    if lat:
+        best = min(lat, key=lambda r: r["delay_ms"])
+        lines.append(("Lowest latency",
+                      "%s  %.0f ms  (%.0f frames held) at default settings" % (
+                          bold(best["encoder"]), best["delay_ms"],
+                          best["delay_frames"])))
     kv(lines, out=out)
 
 
@@ -448,8 +466,14 @@ def render_preset_sweep(results, base_res, base_fps, out=None):
 
 
 def render_axis(results, title, note, axis_attr, base_res, fixed, fmt,
-                out=None, headers_fmt=None):
-    """Generic one-axis table: rows are encoders, columns are axis values."""
+                out=None, headers_fmt=None, incomplete=None):
+    """Generic one-axis table: rows are encoders, columns are axis values.
+
+    A sweep with fewer than two columns has nothing to show, but saying nothing
+    at all is worse: three of these tables once disappeared from a report
+    because the run ran out of time, with the only trace on stderr during the
+    run. `incomplete` carries the reason so the section can say so.
+    """
     out = out or sys.stdout
     from .matrix import bitrate_for
     sel = [r for r in results if r.case.kind == "throughput"
@@ -461,6 +485,9 @@ def render_axis(results, title, note, axis_attr, base_res, fixed, fmt,
         sel = [r for r in sel if r.case.bitrate == target]
     values = sorted({getattr(r.case, axis_attr) for r in sel})
     if len(values) < 2:
+        if incomplete:
+            section(title, out)
+            out.write("  %s\n" % yellow(incomplete))
         return
 
     section(title, out)
@@ -529,6 +556,144 @@ def render_concurrency(ramps, out=None):
           rows, aligns=["left", "left", "right", "right", "left", "left"], out=out)
 
 
+# Order latency rows the way the pass generates them, so the baseline reads
+# first and each sweep follows it.
+_LATENCY_AXIS_ORDER = {"baseline": 0, "low-latency": 1, "resolution": 2,
+                       "preset": 3, "fps": 4}
+
+
+def _ms(value):
+    if value is None:
+        return grey("-")
+    return "%.0f ms" % value
+
+
+def _latency_point(record):
+    preset = record.get("preset")
+    return "%s%s%s" % (record.get("resolution"), record.get("fps"),
+                       "" if preset is None else "  " + str(preset))
+
+
+def render_latency(records, out=None):
+    """Delay per encoder, per operating point.
+
+    A run that could not be measured still gets a row: an encoder that cannot
+    hold realtime has no meaningful delay figure, and saying so is the answer,
+    not an omission.
+    """
+    out = out or sys.stdout
+    if not records:
+        return
+    section("Encode latency", out)
+    out.write("  %s\n" % grey(
+        "input paced at realtime; delay is how many frames the encoder holds "
+        "before its first packet emerges - lookahead plus frame reordering."))
+    out.write("  %s\n\n" % grey(
+        "this, not throughput, is what decides whether a box can run live."))
+
+    ordered = sorted(records, key=lambda r: (
+        r.get("codec") or "", not r.get("hardware"), r.get("encoder") or "",
+        _LATENCY_AXIS_ORDER.get(r.get("axis"), 9),
+        _res_order().index(r["resolution"]) if r.get("resolution") in _res_order() else 9,
+        r.get("fps") or 0))
+
+    rows = []
+    last = None
+    for r in ordered:
+        name = r.get("encoder")
+        mode = "low-latency" if r.get("mode") == "lowlat" else "default"
+        if r.get("partial_mode"):
+            mode = yellow(mode + "*")
+        if not r.get("ok"):
+            # The reason goes in the trailing column, never in a numeric one:
+            # table() sizes each column to its widest cell, so a sentence in
+            # the delay column would pad every delay figure out to its width.
+            rows.append([name if name != last else "", _kind_flag(r),
+                         _latency_point(r), mode, "", "", "", "",
+                         grey(r.get("error") or "not measured")])
+            last = name
+            continue
+        delay = "%.1f" % r["delay_frames"]
+        if r.get("low_confidence"):
+            delay = yellow(delay + "?")
+        rows.append([
+            name if name != last else "",
+            _kind_flag(r),
+            _latency_point(r),
+            mode,
+            delay,
+            _ms(r.get("delay_ms")),
+            "+%.1f" % (r.get("worst_excursion_frames") or 0.0),
+            "%.2f ms" % r["frame_time_ms"] if r.get("frame_time_ms") else grey("-"),
+            "",
+        ])
+        last = name
+
+    table(["ENCODER", "TYPE", "POINT", "MODE", "DELAY fr", "DELAY", "WORST fr",
+           "FRAME TIME", "NOTE"], rows,
+          aligns=["left", "left", "left", "left", "right", "right", "right",
+                  "right", "left"], out=out)
+
+    notes = []
+    if any(r.get("low_confidence") for r in records if r.get("ok")):
+        notes.append(
+            "'?' marks a point running under 4x realtime, where the paced and "
+            "unpaced runs are close enough together that the delay carries "
+            "roughly a frame of uncertainty either way.")
+    if any(r.get("partial_mode") for r in records):
+        notes.append(
+            "'*' means the encoder rejected the full low-latency configuration "
+            "and a narrower one was used, so the delay shown is not the lowest "
+            "that encoder could reach.")
+    if any(r.get("worst_excursion_frames") for r in records if r.get("ok")):
+        notes.append(
+            "'worst' is the largest transient the output fell behind its own "
+            "steady schedule - the stall a live pipeline sees as a glitch, on "
+            "top of the constant delay.")
+    for note in notes:
+        out.write("\n  %s\n" % grey(note))
+
+
+def _kind_flag(record):
+    return green("HW") if record.get("hardware") else "SW"
+
+
+def render_startup(costs, out=None):
+    """Fixed cost of starting an encode, from data the run already produced."""
+    out = out or sys.stdout
+    if not costs:
+        return
+    from .latency import startup_by_encoder
+    summary = startup_by_encoder(costs)
+    if not summary:
+        return
+
+    section("Startup cost", out)
+    out.write("  %s\n\n" % grey(
+        "fixed overhead of one ffmpeg invocation - process start, hardware "
+        "device init, filter setup and teardown - separated from encode work. "
+        "It costs nothing to measure: every configuration was already run at "
+        "two different lengths."))
+
+    peak = max(v["startup_seconds"] for v in summary.values())
+    rows = []
+    for name in sorted(summary, key=lambda n: -summary[n]["startup_seconds"]):
+        entry = summary[name]
+        rows.append([
+            name,
+            green("HW") if entry["hardware"] else "SW",
+            "%.0f ms" % (entry["startup_seconds"] * 1000.0),
+            bar(entry["startup_seconds"], peak, 16),
+            grey("median of %d point%s" % (entry["points"],
+                                           "" if entry["points"] == 1 else "s")),
+        ])
+    table(["ENCODER", "TYPE", "STARTUP", "", ""], rows,
+          aligns=["left", "left", "right", "left", "left"], out=out)
+    out.write("\n  %s\n" % grey(
+        "matters when something spawns ffmpeg once per file; it is not part of "
+        "the latency figures above, which cancel it rather than estimate it."))
+
+
 def render_quality(records, out=None):
     out = out or sys.stdout
     if not records:
@@ -580,9 +745,35 @@ def render_quality(records, out=None):
             % ", ".join(names)))
 
 
-def render_warnings(results, skips, sysinfo, elapsed, out=None):
+def render_warnings(results, skips, sysinfo, elapsed, out=None,
+                    latency_records=None, coverage=None):
     out = out or sys.stdout
     notes = []
+
+    # First, because it changes how everything below should be read: a run that
+    # stopped early is not a measurement of this machine's full capability.
+    if coverage and coverage.get("stopped_early"):
+        planned = coverage.get("planned") or 0
+        completed = coverage.get("completed") or 0
+        notes.append((red("incomplete run"),
+                      "%s. %d of %d planned tests ran; tables below show only "
+                      "what was measured. --resume on the .jsonl continues it."
+                      % (coverage["stopped_early"], completed, planned)))
+
+    # Both halves of the same finding: encoders that were measured and came back
+    # unusable, and encoders never attempted because a real throughput figure
+    # already said what they would cost. Reporting only the first would make the
+    # gate look like an omission.
+    stalled = {r["encoder"] for r in (latency_records or [])
+               if not r.get("ok") and "paced" in (r.get("error") or "")}
+    stalled |= {g["encoder"] for g in ((coverage or {}).get("latency_gated") or [])}
+    if stalled:
+        notes.append((yellow("latency not measured"),
+                      "%s could not be timed at every point: the input is paced "
+                      "slowly enough for the encoder to be measurable, and for "
+                      "these that would cost more wall time than the figure is "
+                      "worth. A budget limit, not a property of the encoder."
+                      % ", ".join(sorted(stalled))))
 
     decode_bound = sorted({r.case.encoder.name for r in results if r.decode_bound})
     if decode_bound:

@@ -124,6 +124,7 @@ class TestResult(object):
             "encode_fps": _round(self.encode_fps, 2),
             "realtime_x": _round(self.realtime_x, 3),
             "wall_seconds": _round(self.wall_seconds, 3),
+            "rtime": _round(self.rtime, 3),
             "cpu_seconds": _round(self.cpu_seconds, 3),
             "cpu_cores": _round(self.cpu_cores, 2),
             "maxrss_bytes": self.maxrss_bytes,
@@ -148,7 +149,8 @@ def _round(v, n):
 # --------------------------------------------------------------------------
 
 def build_command(ff, case, clip, output="/dev/null", output_format="matroska",
-                  extra_args=None, progress_path=None):
+                  extra_args=None, progress_path=None, paced=False,
+                  stats_period=None, pace_fps=None):
     spec = case.encoder
     # -benchmark writes at AV_LOG_INFO, so "-loglevel error" silently discards
     # utime/stime/rtime/maxrss and every throughput figure falls back to wall
@@ -165,9 +167,44 @@ def build_command(ff, case, clip, output="/dev/null", output_format="matroska",
     progress_target = ("file:" + progress_path) if progress_path else "pipe:1"
     cmd = [ff.path, "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats",
            "-benchmark", "-progress", progress_target, "-y"]
+    # How often -progress emits a block. Left alone (0.5s default) for
+    # throughput, where only the final counters matter; the latency pass needs
+    # a quantum far smaller than one frame and passes its own.
+    if stats_period:
+        cmd += ["-stats_period", "%.4f" % stats_period]
 
     # Hardware device initialisation must precede the input.
     cmd += spec.pre_input
+
+    # Pace the input reader at the target framerate. Latency pass only: it turns
+    # the encoder's structural delay from a few milliseconds of free-running
+    # time into something an order of magnitude larger than process startup
+    # noise. It would destroy a throughput measurement, which is why it is off
+    # by default rather than a property of the case.
+    #
+    # -readrate rather than -re, and expressed against the clip's *stored* rate
+    # rather than the target one: the pacer runs at the demuxer, below the "-r"
+    # below, so it sees the clip's own timestamps and -re would pace a 60 fps
+    # clip at 60 fps no matter what the encode was configured for. Measured: a
+    # 600-frame run of a 60 fps clip with "-re -r 30" takes 9.5s, not the 20s
+    # that pacing at 30 would give.
+    #
+    # The initial burst must also be disabled, or the pacer hands over the
+    # first ~0.5s of input for free -- fifteen frames at 30 fps, more than
+    # enough to fill a lookahead and make a deep pipeline read as a shallow
+    # one. A zero there means "use the default", so it takes a small positive
+    # value instead.
+    if paced:
+        rate = float(getattr(clip, "rate", None) or case.fps)
+        # The pacing rate is not necessarily the content rate. Delay is solved
+        # from (1/pace - 1/E), which is ill-conditioned as E approaches the
+        # pacing rate and undefined at or below it -- so pacing an encoder that
+        # cannot reach realtime at its own content rate measures nothing.
+        # Pacing slower keeps the arithmetic well-conditioned for any encoder;
+        # delay is still a frame count, and converts to ms at the content rate.
+        target = float(pace_fps or case.fps)
+        cmd += ["-readrate", "%.10g" % (target / rate),
+                "-readrate_initial_burst", "0.001"]
 
     # Loop the short cached clip up to the requested measurement length, and
     # reinterpret its nominal rate as the target fps so rate control and GOP
@@ -264,6 +301,90 @@ def drain_progress(path):
             os.remove(path)
         except OSError:
             pass
+
+
+class ProgressTailer(threading.Thread):
+    """Follows a -progress file live, stamping each block with a wall time.
+
+    drain_progress reads the file once the process has exited, which is all a
+    throughput measurement needs. Latency needs to know *when* a frame came out,
+    so this follows the file while the encode runs and records one
+    (seconds-since-launch, frames-out) sample per block.
+
+    ffmpeg flushes the progress AVIO after writing each block, so a block's
+    arrival time really is an observation of when the encoder had produced that
+    many frames -- but only to within -stats_period, which the caller must set
+    small enough (see latency.stats_period_for).
+    """
+
+    def __init__(self, path, start_time, interval=0.004):
+        threading.Thread.__init__(self, daemon=True)
+        self.path = path
+        self.start_time = start_time
+        self.interval = interval
+        self.samples = []              # (seconds since start_time, frames out)
+        self._stop_event = threading.Event()
+        self._buf = ""
+        self._frame = 0
+
+    def run(self):
+        fh = None
+        try:
+            while not self._stop_event.is_set():
+                if fh is None:
+                    try:
+                        fh = open(self.path, "r", encoding="utf-8",
+                                  errors="replace")
+                    except OSError:
+                        self._stop_event.wait(self.interval)
+                        continue
+                if not self._pump(fh):
+                    self._stop_event.wait(self.interval)
+        finally:
+            if fh is not None:
+                # One last read: the final blocks are usually written between
+                # the process exiting and this thread being told to stop.
+                try:
+                    self._pump(fh)
+                finally:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+
+    def _pump(self, fh):
+        try:
+            chunk = fh.read()
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        now = time.monotonic() - self.start_time
+        self._buf += chunk
+        lines = self._buf.split("\n")
+        self._buf = lines.pop()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("frame="):
+                try:
+                    self._frame = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("progress="):
+                # End of a block: everything above it belongs to this instant.
+                self.samples.append((now, self._frame))
+        return True
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=5)
+
+    def first_output_at(self):
+        """When the first encoded frame was muxed, seconds since launch."""
+        for seconds, frames in self.samples:
+            if frames >= 1:
+                return seconds
+        return None
 
 
 # -progress emits only these keys; anything else on a line is foreign noise.

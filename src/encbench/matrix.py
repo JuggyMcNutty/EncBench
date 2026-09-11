@@ -53,7 +53,8 @@ TIER_NAMES = {
 class Profile(object):
     def __init__(self, name, resolutions, fps_list, bitrates, complexities,
                  preset_count, repeats, measure_seconds, budget_minutes,
-                 concurrency_max, full_cross=False, quality=False):
+                 concurrency_max, full_cross=False, quality=False,
+                 latency_axes=("baseline",), latency_seconds=4.0):
         self.name = name
         self.resolutions = resolutions
         self.fps_list = fps_list
@@ -66,6 +67,11 @@ class Profile(object):
         self.concurrency_max = concurrency_max
         self.full_cross = full_cross
         self.quality = quality
+        # Which latency axes to sweep, and how long each paced run lasts. The
+        # paced run costs its wall time regardless of how fast the encoder is,
+        # so this is the one profile knob that does not scale with the machine.
+        self.latency_axes = latency_axes
+        self.latency_seconds = latency_seconds
 
 
 def clone_profile(profile):
@@ -84,8 +90,13 @@ PROFILES = {
         preset_count=2,
         repeats=1,
         measure_seconds=1.5,
-        budget_minutes=6,
+        # Quick by scope, not by amputation. A six-minute wall was tuned on a
+        # fast box; on a 4-core one it completed 8 of 46 tests and reported
+        # almost nothing. What makes this profile cheap is the axes below.
+        budget_minutes=None,
         concurrency_max=4,
+        latency_axes=("baseline",),
+        latency_seconds=3.0,
     ),
     "standard": Profile(
         name="standard",
@@ -96,8 +107,15 @@ PROFILES = {
         preset_count=3,
         repeats=1,
         measure_seconds=2.5,
-        budget_minutes=25,
+        # No wall. Plan cost scales with how many encoders the box turns out to
+        # have; a constant budget does not, and a fixed 25 minutes dropped 65 of
+        # 164 tests -- three whole tables -- on a 15-encoder machine. The
+        # per-test caps still bound any single measurement, and the run projects
+        # its cost after calibration instead. --time-budget puts a wall back.
+        budget_minutes=None,
         concurrency_max=None,
+        latency_axes=("baseline", "lowlat", "resolution", "preset"),
+        latency_seconds=4.0,
     ),
     "deep": Profile(
         name="deep",
@@ -112,6 +130,8 @@ PROFILES = {
         concurrency_max=None,
         full_cross=True,
         quality=True,
+        latency_axes=("baseline", "lowlat", "resolution", "preset", "fps"),
+        latency_seconds=6.0,
     ),
 }
 
@@ -283,6 +303,113 @@ def concurrency_case(spec, profile, resolutions, fps_list, complexities):
         preset=balanced_preset(spec, profile.preset_count),
         rate_mode="bitrate", kind="concurrency",
     )
+
+
+# Latency tiers, executed lowest-first like the throughput tiers.
+LATENCY_TIER_BASELINE = 0
+LATENCY_TIER_LOWLAT = 1
+LATENCY_TIER_RESOLUTION = 2
+LATENCY_TIER_PRESET = 3
+LATENCY_TIER_FPS = 4
+
+
+class LatencyCase(object):
+    """A TestCase plus which latency configuration it represents.
+
+    Kept separate from PlannedCase rather than adding a field to TestCase: the
+    mode would have to join TestCase.key, and that key is what --resume matches
+    completed throughput work against. Widening it would invalidate every
+    existing .jsonl.
+    """
+
+    def __init__(self, case, mode, tier, axis):
+        self.case = case
+        self.mode = mode                 # 'default' | 'lowlat'
+        self.tier = tier
+        self.axis = axis
+
+    @property
+    def key(self):
+        return (self.case.encoder.name, self.case.res_key, self.case.fps,
+                self.case.preset, self.mode)
+
+    def __repr__(self):
+        return "LatencyCase(%s, %s, tier=%d)" % (
+            self.case.label(), self.mode, self.tier)
+
+
+def latency_resolutions(resolutions):
+    """Lowest, baseline and highest -- not the whole ladder.
+
+    Pipeline delay is expected to be a constant frame count, so the resolution
+    sweep exists to find where that stops being true (usually because the
+    encoder drops below realtime and the number becomes meaningless). Three
+    points show that; six would just cost six paced runs, each of which costs
+    its wall time no matter how fast the encoder is.
+    """
+    base = baseline_resolution(resolutions)
+    picked = {resolutions[0], base, resolutions[-1]}
+    return sorted(picked, key=sources.RES_ORDER.index)
+
+
+def latency_plan(specs, profile, resolutions=None, fps_list=None,
+                 complexities=None):
+    """Axis sweeps for the latency pass, tiered like build_plan."""
+    resolutions = resolutions or profile.resolutions
+    fps_list = fps_list or profile.fps_list
+    complexities = complexities or profile.complexities
+    axes = getattr(profile, "latency_axes", ("baseline",))
+
+    base_res = baseline_resolution(resolutions)
+    base_fps = baseline_fps(fps_list)
+    base_cx = baseline_complexity(complexities)
+
+    planned = []
+    seen = set()
+
+    def add(spec, res_key, fps, preset, mode, tier, axis):
+        width, height = sources.RES_BY_KEY[res_key]
+        case = TestCase(
+            encoder=spec, res_key=res_key, width=width, height=height,
+            fps=fps, complexity=base_cx, frames=0,
+            bitrate=bitrate_for(res_key, "target"), preset=preset,
+            rate_mode="bitrate", kind="latency",
+        )
+        entry = LatencyCase(case, mode, tier, axis)
+        if entry.key in seen:
+            return
+        seen.add(entry.key)
+        planned.append(entry)
+
+    for spec in specs:
+        base_preset = balanced_preset(spec, profile.preset_count)
+
+        add(spec, base_res, base_fps, base_preset, "default",
+            LATENCY_TIER_BASELINE, "baseline")
+
+        if "lowlat" in axes:
+            add(spec, base_res, base_fps, base_preset, "lowlat",
+                LATENCY_TIER_LOWLAT, "low-latency")
+
+        if "resolution" in axes:
+            for res_key in latency_resolutions(resolutions):
+                add(spec, res_key, base_fps, base_preset, "default",
+                    LATENCY_TIER_RESOLUTION, "resolution")
+
+        if "preset" in axes:
+            for preset in spec.speed_triple():
+                add(spec, base_res, base_fps, preset, "default",
+                    LATENCY_TIER_PRESET, "preset")
+
+        if "fps" in axes:
+            for fps in fps_list:
+                add(spec, base_res, fps, base_preset, "default",
+                    LATENCY_TIER_FPS, "fps")
+
+    order = {spec.name: i for i, spec in enumerate(specs)}
+    planned.sort(key=lambda lc: (lc.tier, order.get(lc.case.encoder.name, 99),
+                                 sources.RES_ORDER.index(lc.case.res_key)))
+    return planned
 
 
 def quality_plan(specs, profile, resolutions, fps_list):

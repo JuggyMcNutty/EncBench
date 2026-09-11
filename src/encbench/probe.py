@@ -24,6 +24,29 @@ EXTENDED_CODECS = DEFAULT_CODECS | {"mpeg2video", "mpeg4", "vvc", "theora", "pro
 # Encoders that are not really video compressors for our purposes.
 ALWAYS_SKIP = {"wrapped_avframe", "rawvideo", "bitpacked", "vnull"}
 
+
+def popularity(spec):
+    """Execution rank: how widely this encoder is actually deployed.
+
+    Encoders used to be ordered alphabetically by codec, which put `av1` first
+    and so led every tier with libaom-av1 (1.1 fps on a fast laptop) and
+    librav1e (0.4 fps) -- the two slowest things on the box, before anything
+    anyone was benchmarking for. Nothing bounds a run by the clock any more, so
+    order is what decides whether an interrupted one is useful: stop a run at
+    ninety seconds and it should already hold the mainstream numbers.
+    """
+    if spec.hardware and spec.codec in ("h264", "hevc"):
+        return 1                     # "can this box do video" usually means this
+    if spec.name in ("libx264", "libx265"):
+        return 2                     # the universal comparison point
+    if spec.name == "libsvtav1" or (spec.hardware and spec.codec == "av1"):
+        return 3                     # AV1 as actually shipped
+    if spec.name in ("libaom-av1", "librav1e"):
+        return 5                     # reference encoders: correct, not quick
+    if spec.codec in DEFAULT_CODECS:
+        return 4                     # vp9/vp8 and the second-string h264/hevc
+    return 5                         # extended codecs, only with --extended-codecs
+
 # Valid encoders whose numbers are not comparable in a YUV benchmark.
 SKIP_UNLESS_ALL = {"libx264rgb", "libopenjpeg"}
 
@@ -423,7 +446,8 @@ def probe_encoders(ff, sysinfo, all_encoders=False, only=None, exclude=None,
     for spec in hw:
         _validate(ff, spec, nodes)
 
-    specs.sort(key=lambda s: (not s.ok, s.codec, s.hardware, s.name))
+    specs.sort(key=lambda s: (not s.ok, popularity(s), s.codec,
+                              not s.hardware, s.name))
     return specs
 
 

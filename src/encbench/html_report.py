@@ -304,6 +304,64 @@ def build_html(payload):
         a(_table(["Encoder", "Realtime streams", "Peak aggregate fps", "Limit"], trows))
         a('</section>')
 
+    # ---- latency ----
+    latency = payload.get("latency") or []
+    ok_latency = [r for r in latency if r.get("ok")]
+    if ok_latency:
+        a('<section><h2>Encode latency</h2>')
+        a('<p class="note">Input paced at realtime. <b>Delay</b> is how many '
+          'frames the encoder holds before its first packet emerges &mdash; '
+          'lookahead plus frame reordering. Shorter is better; this, not '
+          'throughput, decides whether a box can run live.</p>')
+        head = [r for r in ok_latency
+                if r.get("mode") == "default" and r.get("axis") == "baseline"]
+        if head:
+            a(bar_chart([(r["encoder"], r.get("delay_ms") or 0, r.get("hardware"))
+                         for r in sorted(head, key=lambda x: x.get("delay_ms") or 0)],
+                        unit="ms delay"))
+        trows = []
+        for r in sorted(latency, key=lambda x: (x.get("encoder") or "",
+                                                x.get("axis") or "",
+                                                x.get("resolution") or "")):
+            point = "%s%s%s" % (r.get("resolution"), r.get("fps"),
+                                "" if r.get("preset") is None
+                                else " " + str(r["preset"]))
+            mode = "low-latency" if r.get("mode") == "lowlat" else "default"
+            if not r.get("ok"):
+                trows.append(['<b>%s</b>' % _esc(r.get("encoder")), _esc(point),
+                              _esc(mode),
+                              '<span class="note">%s</span>'
+                              % _esc(r.get("error") or "not measured"),
+                              "&mdash;", "&mdash;", "&mdash;"])
+                continue
+            trows.append(['<b>%s</b>' % _esc(r.get("encoder")), _esc(point),
+                          _esc(mode), _fmt(r.get("delay_frames")),
+                          _fmt(r.get("delay_ms"), 0),
+                          "+" + _fmt(r.get("worst_excursion_frames")),
+                          _fmt(r.get("frame_time_ms"), 2)])
+        a(_table(["Encoder", "Point", "Mode", "Delay (frames)", "Delay (ms)",
+                  "Worst excursion (frames)", "Frame time (ms)"], trows))
+        a('</section>')
+
+    # ---- startup cost ----
+    startup = payload.get("startup") or []
+    if startup:
+        from .latency import startup_by_encoder
+        summary = startup_by_encoder(startup)
+        if summary:
+            a('<section><h2>Startup cost</h2>')
+            a('<p class="note">Fixed overhead of one ffmpeg invocation &mdash; '
+              'process start, hardware device init, filter setup and teardown. '
+              'It matters when something spawns ffmpeg once per file. Derived '
+              'from runs the benchmark already made, at no extra cost.</p>')
+            a(bar_chart([(name, entry["startup_seconds"] * 1000.0,
+                          entry["hardware"])
+                         for name, entry in sorted(
+                             summary.items(),
+                             key=lambda kv: -kv[1]["startup_seconds"])],
+                        unit="ms"))
+            a('</section>')
+
     # ---- quality ----
     quality = payload.get("quality") or []
     if quality:
@@ -327,6 +385,63 @@ def build_html(payload):
                     _fmt(q.get("encode_fps"))]
             trows.append(row)
         a(_table(headers, trows))
+        a('</section>')
+
+    # ---- coverage ----
+    # What the plan asked for against what ran. A sweep that did not run must be
+    # visible as an absence, not simply missing from the page.
+    coverage = payload.get("coverage") or {}
+    axes = coverage.get("axes") or {}
+    partial = {name: e for name, e in axes.items()
+               if (e.get("ran") or 0) < (e.get("planned") or 0)}
+    lat = coverage.get("latency") or {}
+    lat_partial = (lat.get("ran") or 0) < (lat.get("planned") or 0)
+    light = coverage.get("light") or []
+    lat_gated = coverage.get("latency_gated") or []
+    stopped = coverage.get("stopped_early")
+    if stopped or lat_partial or light or lat_gated:
+        a('<section><h2>Coverage</h2>')
+        a('<div class="method"><p>What the plan asked for against what ran. '
+          'Points listed as not measured were either skipped deliberately '
+          '&mdash; below the rate at which the measurement can say anything '
+          '&mdash; or left unrun; the reasons are individually recorded.</p></div>')
+        if stopped:
+            a('<div class="hint"><div class="hint-title">Incomplete run</div>'
+              '<div class="hint-line">%s. %s of %s planned tests ran.</div></div>'
+              % (_esc(stopped), _esc(coverage.get("completed")),
+                 _esc(coverage.get("planned"))))
+        trows = []
+        if stopped:
+            # Axis shortfalls on a completed run are explained by the skip list;
+            # only a run that stopped short needs them called out per sweep.
+            for name in sorted(partial):
+                entry = partial[name]
+                trows.append([_esc(name), _esc(entry.get("ran")),
+                              _esc(entry.get("planned"))])
+        if lat_partial:
+            trows.append(["latency", _esc(lat.get("ran")), _esc(lat.get("planned"))])
+        if trows:
+            a(_table(["Sweep", "Measured", "Planned"], trows))
+        for entry in light:
+            a('<div class="hint-line"><b>%s</b> &mdash; %s</div>'
+              % (_esc(entry.get("encoder")), _esc(entry.get("reason"))))
+        # One line per encoder rather than per point: the same finding repeats
+        # across the resolution and preset sweeps.
+        gated = {}
+        for entry in lat_gated:
+            gated.setdefault(entry.get("encoder"), entry)
+        for name in sorted(gated):
+            entry = gated[name]
+            rate = entry.get("measured_fps")
+            # Name the preset: the rate that decided this is that preset's, and
+            # the encoder's fastest preset is a much larger and unrelated number.
+            preset = entry.get("preset")
+            detail = "" if rate is None else " (%.1f fps at %s%s%s)" % (
+                rate, entry.get("resolution"), entry.get("fps"),
+                "" if preset in (None, "") else " %s" % preset)
+            a('<div class="hint-line"><b>%s</b> &mdash; latency not measured: '
+              '%s%s</div>'
+              % (_esc(name), _esc(entry.get("reason")), _esc(detail)))
         a('</section>')
 
     # ---- encoders ----

@@ -53,6 +53,7 @@ class FFmpeg(object):
         self.configuration = configuration
         self.origin = origin            # 'user' | 'system' | 'downloaded'
         self._filters = None
+        self._options = None
 
     # -- capability shims -------------------------------------------------
 
@@ -67,6 +68,27 @@ class FFmpeg(object):
             p = run([self.path, "-hide_banner", "-filters"], timeout=30)
             self._filters = p.out
         return re.search(r"^\s*\S+\s+%s\s" % re.escape(name), self._filters, re.M) is not None
+
+    def has_option(self, name):
+        """Whether this build accepts a given command-line option.
+
+        Probed, not inferred from the version number. -stats_period landed in
+        4.4, but distributions ship patched and backported builds, and guessing
+        wrong here does not fail loudly: the latency pass would silently sample
+        at the 0.5s default, which at 30 fps is a quantum of fifteen frames --
+        larger than the delay being measured.
+        """
+        if self._options is None:
+            p = run([self.path, "-hide_banner", "-h", "full"], timeout=120)
+            self._options = (p.out or "") + (p.err or "")
+        return re.search(r"^\s*-%s(\s|$)" % re.escape(name),
+                         self._options, re.M) is not None
+
+    def stats_period_args(self, seconds):
+        """How often -progress emits a block. None when unsupported."""
+        if not self.has_option("stats_period"):
+            return None
+        return ["-stats_period", "%.4f" % seconds]
 
     def config_has(self, token):
         return token in self.configuration

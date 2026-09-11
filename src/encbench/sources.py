@@ -61,12 +61,17 @@ class SourceClip(object):
         self.frames = frames
         self.fmt = fmt               # 'raw' | 'lossless'
         self.decode_fps = None       # measured ceiling, frames/sec
+        # Nominal rate the clip is stored at. Every encode reinterprets this as
+        # its own target framerate, so it has to be known rather than assumed:
+        # a --source clip carries whatever rate its own footage had.
+        self.rate = float(BASE_RATE)
 
     def as_dict(self):
         return {"path": self.path, "resolution": self.res_key,
                 "complexity": self.complexity, "width": self.width,
                 "height": self.height, "frames": self.frames,
-                "format": self.fmt, "decode_fps": self.decode_fps}
+                "format": self.fmt, "decode_fps": self.decode_fps,
+                "rate": self.rate}
 
     def __repr__(self):
         return "SourceClip(%s/%s, %dx%d, %d frames, %s)" % (
@@ -248,10 +253,15 @@ class SourceLibrary(object):
                                   util.human_bytes(os.path.getsize(clip.path))))
 
     def _measure_decode(self, clip):
-        """Decode-only throughput: the ceiling every encode result sits under."""
+        """Decode-only throughput: the ceiling every encode result sits under.
+
+        Also the cheapest place to learn the clip's stored frame rate: this
+        invocation already prints the stream line.
+        """
         cmd = [self.ff.path, "-nostdin", "-hide_banner", "-benchmark",
                "-i", clip.path, "-f", "null", "-"]
         p = run(cmd, timeout=600)
+        clip.rate = _detect_rate(clip.path, (p.err or "") + (p.out or ""))
         if not p.ok:
             return None
         m = re.search(r"bench: utime=\S+ stime=\S+ rtime=([\d.]+)s", p.err or p.out)
@@ -280,6 +290,39 @@ class SourceLibrary(object):
     def cleanup(self):
         for path in glob.glob(os.path.join(self.dir, "*")):
             _unlink(path)
+
+
+# "F<num>:<den>" in a yuv4mpeg header is the frame rate, exactly.
+_Y4M_RATE_RE = re.compile(rb"\bF(\d+):(\d+)\b")
+_FPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s+fps\b")
+
+
+def _detect_rate(path, ffmpeg_text=""):
+    """Stored frame rate of a clip, preferring the container's own header.
+
+    Needed because an encode retimes the clip to its target framerate, and the
+    scale factor is (stored rate / target rate). Guessing BASE_RATE here would
+    silently mis-time any --source footage.
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.readline(512)
+        m = _Y4M_RATE_RE.search(header)
+        if m and int(m.group(2)):
+            return int(m.group(1)) / float(m.group(2))
+    except OSError:
+        pass
+    m = _FPS_RE.search(ffmpeg_text or "")
+    if m:
+        try:
+            value = float(m.group(1))
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    detail("could not read the frame rate of %s; assuming %d fps"
+           % (os.path.basename(path), BASE_RATE))
+    return float(BASE_RATE)
 
 
 def _unlink(path):

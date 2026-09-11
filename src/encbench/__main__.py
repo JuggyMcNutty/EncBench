@@ -73,6 +73,8 @@ def build_parser():
                    help="also measure PSNR/SSIM/VMAF (slower)")
     g.add_argument("--no-concurrency", action="store_true",
                    help="skip the concurrent-stream ramp")
+    g.add_argument("--no-latency", action="store_true",
+                   help="skip the encode-latency pass")
     g.add_argument("--concurrency-max", type=int, metavar="N",
                    help="highest parallel stream count to try")
     g.add_argument("--source", metavar="FILE",
@@ -206,20 +208,24 @@ def run(args):
 
     planned = matrix.build_plan(usable, profile, resolutions, fps_list,
                                 complexities, bitrates)
+    latency_planned = [] if args.no_latency else matrix.latency_plan(
+        usable, profile, resolutions, fps_list, complexities)
 
     run_id = "%s-%s" % (sysinfo["hostname"],
                         datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     results_dir = _results_dir(args)
 
     orch = bench.Orchestrator(ff, library, usable, profile, args,
-                              run_id, results_dir)
+                              run_id, results_dir,
+                              anchor_specs=[s for s in specs if s.ok])
     if args.resume:
         n = orch.load_resume(args.resume)
         info("  %s" % util.grey("resuming: %d completed tests loaded" % n))
 
     budget = args.time_budget if args.time_budget is not None else profile.budget_minutes
     elapsed = orch.execute(planned, usable, resolutions, fps_list,
-                           complexities, budget, metrics)
+                           complexities, budget, metrics,
+                           latency_planned=latency_planned)
 
     base_res = matrix.baseline_resolution(resolutions)
     base_fps = matrix.baseline_fps(fps_list)
@@ -244,7 +250,8 @@ def render_all(orch, base_res, base_fps, base_cx, sysinfo, elapsed):
     if not results:
         warn("no successful measurements")
         return
-    report.render_headline(results, orch.ramps, base_res, base_fps)
+    report.render_headline(results, orch.ramps, base_res, base_fps,
+                           latency_records=orch.latency_results)
     report.render_resolution_scaling(results, base_fps, base_cx)
     report.render_preset_sweep(results, base_res, base_fps)
 
@@ -255,14 +262,16 @@ def render_all(orch, base_res, base_fps, base_cx, sysinfo, elapsed):
         "bitrate", base_res,
         {"fps": base_fps, "complexity": base_cx},
         lambda r: report.fps_cell(r, base_fps),
-        headers_fmt=lambda v: util.human_rate(v))
+        headers_fmt=lambda v: util.human_rate(v),
+        incomplete=orch.axis_incomplete("bitrate"))
 
     report.render_axis(
         results, "Throughput by framerate",
         "same pixels per frame, different realtime targets, at %s" % base_res,
         "fps", base_res, {"complexity": base_cx},
         lambda r: report.fps_cell(r, r.case.fps),
-        headers_fmt=lambda v: "%d fps" % v)
+        headers_fmt=lambda v: "%d fps" % v,
+        incomplete=orch.axis_incomplete("fps"))
 
     report.render_axis(
         results, "Throughput by content complexity",
@@ -270,11 +279,16 @@ def render_all(orch, base_res, base_fps, base_cx, sysinfo, elapsed):
         "constant motion and grain",
         "complexity", base_res, {"fps": base_fps},
         lambda r: report.fps_cell(r, base_fps),
-        headers_fmt=lambda v: str(v).upper())
+        headers_fmt=lambda v: str(v).upper(),
+        incomplete=orch.axis_incomplete("complexity"))
 
     report.render_concurrency(orch.ramps)
+    report.render_latency(orch.latency_results)
+    report.render_startup(orch.startup_costs())
     report.render_quality(orch.quality_results)
-    report.render_warnings(results, orch.skips, sysinfo, elapsed)
+    report.render_warnings(results, orch.skips, sysinfo, elapsed,
+                           latency_records=orch.latency_results,
+                           coverage=orch.coverage())
 
     print()
     print("  %s" % util.grey("%d measurements in %s"
@@ -311,7 +325,10 @@ def build_payload(orch, run_id, profile, ff, sysinfo, scratch_note, library,
             for name, entry in orch.ramps.items()
         },
         "quality": orch.quality_results,
+        "latency": orch.latency_results,
+        "startup": orch.startup_costs(),
         "skips": [s.as_dict() for s in orch.skips],
+        "coverage": orch.coverage(),
     }
 
 
